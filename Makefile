@@ -12,8 +12,13 @@ UNAME_S := $(shell uname -s)
 
 all: clean fmt vet build
 
+deps: ## Download dependencies
+	@echo "Downloading dependencies..."
+	@go mod download
+	@go mod verify
+
 # Native build (works on Linux, requires cross-compilation toolchain on other platforms)
-build:
+build: deps
 	@echo "Building $(BINARY)..."
 	@mkdir -p $(BIN_DIR)
 	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build $(BUILD_FLAGS) -o $(BIN_DIR)/$(BINARY) .
