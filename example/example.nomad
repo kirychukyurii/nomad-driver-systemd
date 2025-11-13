@@ -1,16 +1,16 @@
 # Copyright (c) HashiCorp, Inc.
 # SPDX-License-Identifier: MPL-2.0
 
-job "example" {
+job "systemd-example" {
   datacenters = ["dc1"]
-  type        = "batch"
+  type        = "service"
 
-  group "example" {
-    task "hello-world" {
-      driver = "hello-world-example"
+  group "g" {
+    task "unit-task" {
+      driver = "systemd"
 
       config {
-        greeting = "hello"
+        unit = "my.service" # replace with your unit name, e.g., "nginx.service"
       }
     }
   }

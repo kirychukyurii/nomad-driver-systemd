@@ -4,19 +4,34 @@
 package main
 
 import (
-	// TODO: update the path below to match your own repository
-	"github.com/hashicorp/nomad-skeleton-driver-plugin/hello"
+	"log"
+	"net/http"
+	_ "net/http/pprof"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad/plugins"
+
+	"github.com/kirychuk/nomad-systemd-driver-plugin/plugin"
 )
+
+func init() {
+	go func() {
+		log.Println("pprof listening on :6061")
+
+		if err := http.ListenAndServe("127.0.0.1:6061", nil); err != nil {
+			log.Println("pprof error", "error", err)
+
+			return
+		}
+	}()
+}
 
 func main() {
 	// Serve the plugin
 	plugins.Serve(factory)
 }
 
-// factory returns a new instance of a nomad driver plugin
+// factory returns a new instance of the systemd driver plugin
 func factory(log hclog.Logger) interface{} {
-	return hello.NewPlugin(log)
+	return plugin.New(log)
 }

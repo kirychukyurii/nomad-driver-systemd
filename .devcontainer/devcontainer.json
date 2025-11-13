@@ -1,0 +1,38 @@
+{
+  "name": "Nomad Systemd Driver Plugin",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "go.gopath": "/go",
+        "go.goroot": "/usr/local/go",
+        "go.toolsManagement.checkForUpdates": "local",
+        "go.useLanguageServer": true,
+        "go.lintTool": "golangci-lint",
+        "go.lintOnSave": "package",
+        "editor.formatOnSave": true,
+        "go.formatTool": "gofmt"
+      },
+      "extensions": [
+        "golang.go",
+        "hashicorp.hcl"
+      ]
+    }
+  },
+  "remoteUser": "root",
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "mounts": [
+    "source=${localWorkspaceFolderBasename}-gomodcache,target=/go/pkg/mod,type=volume"
+  ],
+  "postCreateCommand": "go mod download",
+  "features": {
+    "ghcr.io/devcontainers/features/git:1": {},
+    "ghcr.io/devcontainers/features/go:1": {
+      "version": "1.24.4"
+    }
+  }
+}

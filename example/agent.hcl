@@ -3,8 +3,8 @@
 
 log_level = "TRACE"
 
-plugin "hello-driver" {
+plugin "nomad-driver-systemd" {
   config {
-    shell = "bash"
+    # no driver-level configuration required
   }
 }
