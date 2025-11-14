@@ -10,6 +10,7 @@ import (
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad/plugins/drivers"
+
 	"github.com/kirychuk/nomad-systemd-driver-plugin/pkg/systemd"
 )
 
@@ -227,12 +228,18 @@ func (th *Handler) handleStateChange(activeState systemd.UnitState) {
 	th.stateLock.Lock()
 	defer th.stateLock.Unlock()
 
-	oldState := th.state
-	th.state = systemd.ToTaskState(activeState)
-	th.logger.Info("task state changed", "old_state", oldState, "new_state", th.state, "systemd_state", activeState.String())
+	var (
+		ost = th.state
+		cst = systemd.ToTaskState(activeState)
+	)
+
+	if ost == cst {
+		th.state = cst
+		th.logger.Info("task state changed", "old_state", ost, "new_state", th.state, "systemd_state", activeState.String())
+	}
 
 	// If task exited, close wait channel and record completion
-	if th.state == drivers.TaskStateExited && oldState != drivers.TaskStateExited {
+	if th.state == drivers.TaskStateExited && ost != drivers.TaskStateExited {
 		th.completedAt = time.Now()
 		th.exitResult = &drivers.ExitResult{
 			ExitCode: 0,
