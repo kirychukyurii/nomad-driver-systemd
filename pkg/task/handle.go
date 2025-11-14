@@ -233,7 +233,7 @@ func (th *Handler) handleStateChange(activeState systemd.UnitState) {
 		cst = systemd.ToTaskState(activeState)
 	)
 
-	if ost == cst {
+	if ost != cst {
 		th.state = cst
 		th.logger.Info("task state changed", "old_state", ost, "new_state", th.state, "systemd_state", activeState.String())
 	}
