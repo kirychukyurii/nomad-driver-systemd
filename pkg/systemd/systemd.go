@@ -42,6 +42,10 @@ type Manager struct {
 	unitProperties     map[string]*unitPropertyCache
 	unitPropertiesLock sync.RWMutex
 
+	// Journal streaming cancellation per unit
+	journalCancels     map[string]context.CancelFunc
+	journalCancelsLock sync.RWMutex
+
 	compute cpustats.Compute
 
 	ctx    context.Context
@@ -81,6 +85,7 @@ func NewManager(ctx context.Context, compute cpustats.Compute, logger hclog.Logg
 		eventChans:     make(map[string]chan Message),
 		cpuTracking:    make(map[string]*cpuTracker),
 		unitProperties: make(map[string]*unitPropertyCache),
+		journalCancels: make(map[string]context.CancelFunc),
 		compute:        compute,
 		ctx:            managerCtx,
 		cancel:         cancel,
@@ -139,6 +144,14 @@ func (sm *Manager) RegisterUnit(unit string) <-chan Message {
 
 // UnregisterUnit stops monitoring a unit
 func (sm *Manager) UnregisterUnit(unit string) {
+	// Cancel journal streaming goroutine first
+	sm.journalCancelsLock.Lock()
+	if cancelFunc, ok := sm.journalCancels[unit]; ok {
+		cancelFunc()
+		delete(sm.journalCancels, unit)
+	}
+	sm.journalCancelsLock.Unlock()
+
 	// Close the event channel
 	sm.eventChLock.Lock()
 	if ch, ok := sm.eventChans[unit]; ok {
@@ -299,15 +312,16 @@ func (sm *Manager) stopUnit(unit string) error {
 }
 
 // getUnitState retrieves the current state of a unit as a SystemdUnitState
+// Uses GetUnitPropertyContext to fetch only ActiveState (lighter than GetUnitPropertiesContext)
 func (sm *Manager) getUnitState(unit string) (UnitState, error) {
-	properties, err := sm.Conn.GetUnitPropertiesContext(sm.ctx, unit)
+	activeStateProp, err := sm.Conn.GetUnitPropertyContext(sm.ctx, unit, "ActiveState")
 	if err != nil {
-		return "", fmt.Errorf("get unit properties: %w", err)
+		return "", fmt.Errorf("get ActiveState property: %w", err)
 	}
 
-	activeStateStr, ok := properties["ActiveState"].(string)
+	activeStateStr, ok := activeStateProp.Value.Value().(string)
 	if !ok {
-		return "", fmt.Errorf("ActiveState property not found")
+		return "", fmt.Errorf("ActiveState property has unexpected type: %T", activeStateProp.Value.Value())
 	}
 
 	return ParseSystemdUnitState(activeStateStr), nil
@@ -510,6 +524,14 @@ func (sm *Manager) calculateCPUPercent(unit string, cpuUsageNsec uint64, cpuStat
 func (sm *Manager) StreamLogs(unit string, logCh chan<- *LogEntry) error {
 	sm.logger.Debug("starting log streamer", "unit", unit)
 
+	// Cancel any existing journal goroutine for this unit
+	sm.journalCancelsLock.Lock()
+	if cancelFunc, ok := sm.journalCancels[unit]; ok {
+		cancelFunc()
+		delete(sm.journalCancels, unit)
+	}
+	sm.journalCancelsLock.Unlock()
+
 	journal, err := sdjournal.NewJournal()
 	if err != nil {
 		return fmt.Errorf("open journal: %w", err)
@@ -526,6 +548,14 @@ func (sm *Manager) StreamLogs(unit string, logCh chan<- *LogEntry) error {
 		journal.SeekTail()
 	}
 
+	// Create a context specific to this unit's journal streaming
+	unitCtx, unitCancel := context.WithCancel(sm.ctx)
+
+	// Store the cancel function so we can stop this goroutine when unit is unregistered
+	sm.journalCancelsLock.Lock()
+	sm.journalCancels[unit] = unitCancel
+	sm.journalCancelsLock.Unlock()
+
 	sm.wg.Add(1)
 	go func() {
 		defer sm.wg.Done()
@@ -533,7 +563,8 @@ func (sm *Manager) StreamLogs(unit string, logCh chan<- *LogEntry) error {
 
 		for {
 			select {
-			case <-sm.ctx.Done():
+			case <-unitCtx.Done():
+				sm.logger.Debug("journal streaming stopped", "unit", unit)
 				return
 			default:
 				n, err := journal.Next()
@@ -568,7 +599,8 @@ func (sm *Manager) StreamLogs(unit string, logCh chan<- *LogEntry) error {
 
 				select {
 				case logCh <- logEntry:
-				case <-sm.ctx.Done():
+				case <-unitCtx.Done():
+					sm.logger.Debug("journal streaming stopped", "unit", unit)
 					return
 				}
 			}
