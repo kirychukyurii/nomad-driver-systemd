@@ -125,3 +125,141 @@ func TestCompileUnitPolicy_InvalidRegex(t *testing.T) {
 		})
 	}
 }
+
+func TestUnitOwnership(t *testing.T) {
+	cases := []struct {
+		name string
+		// ops are applied in order; each is either a claim or a release
+		ops []struct {
+			release bool
+			unit    string
+			taskID  string
+			wantErr bool
+		}
+		wantOwner map[string]string
+	}{
+		{
+			name: "claiming a free unit succeeds",
+			ops: []struct {
+				release bool
+				unit    string
+				taskID  string
+				wantErr bool
+			}{
+				{unit: "app.service", taskID: "task-a"},
+			},
+			wantOwner: map[string]string{"app.service": "task-a"},
+		},
+		{
+			name: "conflicting owner is rejected without mutating state",
+			ops: []struct {
+				release bool
+				unit    string
+				taskID  string
+				wantErr bool
+			}{
+				{unit: "app.service", taskID: "task-a"},
+				{unit: "app.service", taskID: "task-b", wantErr: true},
+			},
+			wantOwner: map[string]string{"app.service": "task-a"},
+		},
+		{
+			name: "reclaiming by the same owner is idempotent",
+			ops: []struct {
+				release bool
+				unit    string
+				taskID  string
+				wantErr bool
+			}{
+				{unit: "app.service", taskID: "task-a"},
+				{unit: "app.service", taskID: "task-a"},
+			},
+			wantOwner: map[string]string{"app.service": "task-a"},
+		},
+		{
+			name: "release allows another task to claim",
+			ops: []struct {
+				release bool
+				unit    string
+				taskID  string
+				wantErr bool
+			}{
+				{unit: "app.service", taskID: "task-a"},
+				{release: true, unit: "app.service"},
+				{unit: "app.service", taskID: "task-b"},
+			},
+			wantOwner: map[string]string{"app.service": "task-b"},
+		},
+		{
+			name: "releasing an unknown unit is a no-op",
+			ops: []struct {
+				release bool
+				unit    string
+				taskID  string
+				wantErr bool
+			}{
+				{release: true, unit: "nope.service"},
+			},
+			wantOwner: map[string]string{},
+		},
+		{
+			name: "different units are independent",
+			ops: []struct {
+				release bool
+				unit    string
+				taskID  string
+				wantErr bool
+			}{
+				{unit: "a.service", taskID: "task-a"},
+				{unit: "b.service", taskID: "task-b"},
+			},
+			wantOwner: map[string]string{"a.service": "task-a", "b.service": "task-b"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newTestDriver()
+
+			for i, op := range tc.ops {
+				if op.release {
+					d.releaseUnit(op.unit)
+
+					continue
+				}
+
+				err := d.claimUnit(op.unit, op.taskID)
+				if (err != nil) != op.wantErr {
+					t.Fatalf("op %d: claimUnit(%q, %q) error = %v, wantErr %v", i, op.unit, op.taskID, err, op.wantErr)
+				}
+			}
+
+			if len(d.unitOwners) != len(tc.wantOwner) {
+				t.Fatalf("owners = %v, want %v", d.unitOwners, tc.wantOwner)
+			}
+
+			for unit, want := range tc.wantOwner {
+				if got := d.unitOwners[unit]; got != want {
+					t.Errorf("owner of %q = %q, want %q", unit, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestClaimUnit_ErrorNamesCurrentOwner(t *testing.T) {
+	d := newTestDriver()
+
+	if err := d.claimUnit("app.service", "task-a"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	err := d.claimUnit("app.service", "task-b")
+	if err == nil {
+		t.Fatalf("expected a conflict error")
+	}
+
+	if !strings.Contains(err.Error(), "task-a") {
+		t.Fatalf("error should name the current owner, got: %v", err)
+	}
+}

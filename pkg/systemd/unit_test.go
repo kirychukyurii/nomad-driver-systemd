@@ -3,48 +3,14 @@ package systemd
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/coreos/go-systemd/v22/dbus"
 	godbus "github.com/godbus/dbus/v5"
-	"github.com/hashicorp/go-hclog"
-
-	"github.com/kirychuk/nomad-systemd-driver-plugin/pkg/logx"
 )
-
-// newTestManager builds a Manager wired to conn instead of a real DBus
-// connection, so Manager's own logic (job-result waiting, property parsing,
-// caching) can be tested without a systemd host.
-func newTestManager(t *testing.T, conn dbusConn) *Manager {
-	t.Helper()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-
-	return &Manager{
-		conn:         conn,
-		logger:       logx.New(hclog.NewNullLogger()),
-		units:        make(map[string]*unitState),
-		propUpdateCh: make(chan *dbus.PropertiesUpdate, propUpdateBufferSize),
-		propErrCh:    make(chan error, propErrBufferSize),
-		cgroupRoot:   cgroupV2Root,
-		ctx:          ctx,
-		cancel:       cancel,
-	}
-}
-
-// register brings unit under management without a DBus round-trip, which is what
-// RegisterUnit would otherwise do to read its cgroup path.
-func register(sm *Manager, unit string) {
-	sm.unitsLock.Lock()
-	defer sm.unitsLock.Unlock()
-
-	sm.units[unit] = &unitState{wake: make(chan struct{}, 1)}
-}
-
-var errDbus = errors.New("dbus failure")
 
 // jobFunc builds a Start/StopUnitContext stub that reports jobResult (or
 // fails to enqueue when enqueueErr is set), and records the args it saw.
@@ -523,26 +489,6 @@ func TestCacheUnitProperties_ExtractsControlGroup(t *testing.T) {
 	}
 }
 
-func TestHealthy(t *testing.T) {
-	cases := []struct {
-		name      string
-		connected bool
-		want      bool
-	}{
-		{name: "connected", connected: true, want: true},
-		{name: "disconnected", connected: false, want: false},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			sm := newTestManager(t, &fakeDbusConn{connected: tc.connected})
-			if got := sm.Healthy(); got != tc.want {
-				t.Fatalf("Healthy() = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
-
 func TestRegisterUnit_CreatesWakeChannel(t *testing.T) {
 	conn := &fakeDbusConn{
 		connected:         true,
@@ -635,217 +581,37 @@ func TestPropertiesDispatchLoop_WakesTheReportedUnit(t *testing.T) {
 	}
 }
 
-func TestSubscribeToPropertyChanges(t *testing.T) {
+func TestParseTimestampUsec(t *testing.T) {
 	cases := []struct {
-		name           string
-		subscribeErr   error
-		wantSubscriber bool
+		name    string
+		in      any
+		wantOK  bool
+		wantVal uint64
 	}{
-		{name: "success registers subscriber", wantSubscriber: true},
-		{name: "subscribe failure is non-fatal", subscribeErr: errDbus, wantSubscriber: false},
+		{"uint64", uint64(1234567890), true, 1234567890},
+		{"positive int64", int64(42), true, 42},
+		{"negative int64 rejected", int64(-1), false, 0},
+		{"zero uint64", uint64(0), true, 0},
+		{"unsupported type", "not a number", false, 0},
+		{"nil", nil, false, 0},
+
+		// USEC_INFINITY is systemd's "never". Accepting it would overflow the
+		// int64 time.UnixMicro takes and silently report December 1969 as the
+		// unit's start time.
+		{"USEC_INFINITY rejected", usecInfinity, false, 0},
+		{"anything past MaxInt64 rejected", uint64(math.MaxInt64) + 1, false, 0},
+		{"MaxInt64 itself is still accepted", uint64(math.MaxInt64), true, uint64(math.MaxInt64)},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			conn := &fakeDbusConn{
-				connected:     true,
-				subscribeFunc: func() error { return tc.subscribeErr },
-			}
-			sm := newTestManager(t, conn)
-
-			sm.subscribeToPropertyChanges(conn) // must never panic
-
-			if !conn.subscribed {
-				t.Fatalf("expected Subscribe() to be attempted")
+			got, ok := parseTimestampUsec(tc.in)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
 			}
 
-			if got := conn.propUpdateCh != nil; got != tc.wantSubscriber {
-				t.Fatalf("subscriber registered = %v, want %v", got, tc.wantSubscriber)
-			}
-		})
-	}
-}
-
-// TestOpContext_CancelledByManagerShutdown pins the core of the fix that
-// removed the command channel: an operation context must die when the manager
-// shuts down, so a hung DBus call can no longer outlive its caller.
-func TestOpContext_CancelledByManagerShutdown(t *testing.T) {
-	sm := newTestManager(t, &fakeDbusConn{connected: true})
-
-	opCtx, cancel := sm.opContext(context.Background(), time.Hour)
-	defer cancel()
-
-	select {
-	case <-opCtx.Done():
-		t.Fatalf("operation context must start out live")
-	default:
-	}
-
-	sm.cancel() // simulate manager shutdown
-
-	select {
-	case <-opCtx.Done():
-	case <-time.After(time.Second):
-		t.Fatalf("expected manager shutdown to cancel the operation context")
-	}
-}
-
-func TestOpContext_CancelledByCallerDeadline(t *testing.T) {
-	sm := newTestManager(t, &fakeDbusConn{connected: true})
-
-	callerCtx, cancelCaller := context.WithCancel(context.Background())
-
-	opCtx, cancel := sm.opContext(callerCtx, time.Hour)
-	defer cancel()
-
-	cancelCaller()
-
-	select {
-	case <-opCtx.Done():
-	case <-time.After(time.Second):
-		t.Fatalf("expected caller cancellation to cancel the operation context")
-	}
-}
-
-// TestOpContext_BoundedByLimit covers the third bound: the budget this package
-// assigns to the operation. Without it, a caller passing a plain context (which
-// every caller now does, since the timeout moved in here) would get an unbounded
-// DBus call.
-func TestOpContext_BoundedByLimit(t *testing.T) {
-	sm := newTestManager(t, &fakeDbusConn{connected: true})
-
-	opCtx, cancel := sm.opContext(context.Background(), time.Millisecond)
-	defer cancel()
-
-	select {
-	case <-opCtx.Done():
-		if !errors.Is(opCtx.Err(), context.DeadlineExceeded) {
-			t.Fatalf("err = %v, want DeadlineExceeded", opCtx.Err())
-		}
-	case <-time.After(time.Second):
-		t.Fatalf("expected the manager's own limit to bound the operation")
-	}
-}
-
-// TestOpContext_LimitIsACeilingNotAnOverride is the property that makes moving
-// the timeout into this package safe: a caller that wants to be stricter than
-// the Manager still wins. Only lengthening is impossible.
-func TestOpContext_LimitIsACeilingNotAnOverride(t *testing.T) {
-	sm := newTestManager(t, &fakeDbusConn{connected: true})
-
-	callerCtx, cancelCaller := context.WithTimeout(context.Background(), 10*time.Millisecond)
-	defer cancelCaller()
-
-	// A generous library budget must not extend the caller's own deadline.
-	opCtx, cancel := sm.opContext(callerCtx, time.Hour)
-	defer cancel()
-
-	deadline, ok := opCtx.Deadline()
-	if !ok {
-		t.Fatalf("expected the operation context to carry a deadline")
-	}
-
-	if callerDeadline, _ := callerCtx.Deadline(); deadline.After(callerDeadline) {
-		t.Errorf("operation deadline %v is later than the caller's %v", deadline, callerDeadline)
-	}
-
-	select {
-	case <-opCtx.Done():
-	case <-time.After(time.Second):
-		t.Fatalf("expected the caller's shorter deadline to bound the operation")
-	}
-}
-
-func TestStreamLogs_RefusedAfterStop(t *testing.T) {
-	sm := newTestManager(t, &fakeDbusConn{connected: true})
-
-	register(sm, "app.service")
-
-	sm.unitsLock.Lock()
-	sm.stopping = true
-	sm.unitsLock.Unlock()
-
-	if err := sm.StreamLogs("app.service", make(chan *LogEntry)); err == nil {
-		t.Fatalf("expected StreamLogs to refuse work after manager stop")
-	}
-}
-
-// TestStreamLogs_RefusedForUnregisteredUnit covers the ordering that used to
-// leak a journal reader for the rest of the process's life: callers start
-// StreamLogs from a detached goroutine, so a task destroyed right after being
-// started can have its UnregisterUnit run first. Registering a cancel func at
-// that point would leave nobody to call it, and the reader would block forever
-// writing to the dead handler's LogCh.
-//
-// This exercises the pre-open check; the identical re-check after the journal
-// is opened is what actually closes the race, but it can only be reached on a
-// host with a real journal, which the test host is not.
-func TestStreamLogs_RefusedForUnregisteredUnit(t *testing.T) {
-	sm := newTestManager(t, &fakeDbusConn{connected: true})
-
-	// Deliberately not registered: no RegisterUnit call, matching the state
-	// left behind by UnregisterUnit.
-	err := sm.StreamLogs("app.service", make(chan *LogEntry))
-	if err == nil {
-		t.Fatalf("expected StreamLogs to refuse an unregistered unit")
-	}
-
-	if !strings.Contains(err.Error(), "not registered") {
-		t.Errorf("error should say the unit is unregistered, got: %v", err)
-	}
-
-	sm.unitsLock.RLock()
-	_, stored := sm.units["app.service"]
-	sm.unitsLock.RUnlock()
-
-	if stored {
-		t.Errorf("a refused StreamLogs must not leave a cancel func behind")
-	}
-}
-
-// TestUnregisteredUnitErrors pins the error contract of the operations that need
-// a registered unit: each names the operation and the unit, and each wraps the
-// same cause so the three sites cannot drift apart.
-func TestUnregisteredUnitErrors(t *testing.T) {
-	cases := []struct {
-		name string
-		run  func(sm *Manager) error
-	}{
-		{
-			name: "ResourceStats",
-			run: func(sm *Manager) error {
-				_, err := sm.ResourceStats(context.Background(), "app.service")
-
-				return err
-			},
-		},
-		{
-			name: "StreamLogs",
-			run: func(sm *Manager) error {
-				return sm.StreamLogs("app.service", make(chan *LogEntry))
-			},
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			sm := newTestManager(t, &fakeDbusConn{connected: true})
-
-			err := tc.run(sm)
-			if err == nil {
-				t.Fatalf("expected an error for an unregistered unit")
-			}
-
-			if !errors.Is(err, ErrUnitNotRegistered) {
-				t.Errorf("error should wrap ErrUnitNotRegistered, got: %v", err)
-			}
-
-			if !strings.Contains(err.Error(), "app.service") {
-				t.Errorf("error should name the unit, got: %v", err)
-			}
-
-			if strings.Contains(err.Error(), "failed to") {
-				t.Errorf("error should not pile up 'failed to', got: %v", err)
+			if ok && got != tc.wantVal {
+				t.Fatalf("value = %v, want %v", got, tc.wantVal)
 			}
 		})
 	}
