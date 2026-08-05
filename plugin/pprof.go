@@ -16,16 +16,18 @@ import (
 	"github.com/kirychuk/nomad-systemd-driver-plugin/pkg/logx"
 )
 
-// pprofReadHeaderTimeout bounds how long the pprof server waits for a client to
-// send its request headers.
-const pprofReadHeaderTimeout = 5 * time.Second
+const (
+	// pprofReadHeaderTimeout bounds how long the pprof server waits for a client
+	// to send its request headers.
+	pprofReadHeaderTimeout = 5 * time.Second
 
-// pprofShutdownTimeout bounds how long stopping the pprof server waits for
-// in-flight profile requests to finish before the listener is closed anyway.
-//
-// A CPU profile or trace runs far longer than this; the point is to release the
-// address promptly on a config reload, not to let a profile complete.
-const pprofShutdownTimeout = 2 * time.Second
+	// pprofShutdownTimeout bounds how long stopping the pprof server waits for
+	// in-flight profile requests to finish before the listener is closed anyway.
+	//
+	// A CPU profile or trace runs far longer than this; the point is to release
+	// the address promptly on a config reload, not to let a profile complete.
+	pprofShutdownTimeout = 2 * time.Second
+)
 
 // pprofServer serves the net/http/pprof endpoints on a single address.
 //
@@ -46,41 +48,6 @@ type pprofServer struct {
 
 	srv      *http.Server
 	stopOnce sync.Once
-}
-
-// configurePprof brings the driver's pprof server in line with addr: it starts
-// one if addr is non-empty, stops the running one if addr is empty, and restarts
-// it if the address changed.
-//
-// An unchanged address is a no-op, so a config reload that does not touch
-// pprof_addr leaves the server and its address binding alone.
-func (d *Driver) configurePprof(addr string) error {
-	d.pprofLock.Lock()
-	defer d.pprofLock.Unlock()
-
-	if d.pprof != nil {
-		if d.pprof.addr == addr {
-			return nil
-		}
-
-		// Stop before binding the new address: the two may be the same port on
-		// different hosts, or the same address written differently.
-		d.pprof.stop()
-		d.pprof = nil
-	}
-
-	if addr == "" {
-		return nil
-	}
-
-	p, err := startPprof(d.ctx, addr, d.logger)
-	if err != nil {
-		return err
-	}
-
-	d.pprof = p
-
-	return nil
 }
 
 // startPprof binds addr and serves the pprof endpoints on it until ctx is
@@ -146,4 +113,39 @@ func (p *pprofServer) stop() {
 		_ = p.srv.Shutdown(ctx)
 		_ = p.ln.Close()
 	})
+}
+
+// configurePprof brings the driver's pprof server in line with addr: it starts
+// one if addr is non-empty, stops the running one if addr is empty, and restarts
+// it if the address changed.
+//
+// An unchanged address is a no-op, so a config reload that does not touch
+// pprof_addr leaves the server and its address binding alone.
+func (d *Driver) configurePprof(addr string) error {
+	d.pprofLock.Lock()
+	defer d.pprofLock.Unlock()
+
+	if d.pprof != nil {
+		if d.pprof.addr == addr {
+			return nil
+		}
+
+		// Stop before binding the new address: the two may be the same port on
+		// different hosts, or the same address written differently.
+		d.pprof.stop()
+		d.pprof = nil
+	}
+
+	if addr == "" {
+		return nil
+	}
+
+	p, err := startPprof(d.ctx, addr, d.logger)
+	if err != nil {
+		return err
+	}
+
+	d.pprof = p
+
+	return nil
 }

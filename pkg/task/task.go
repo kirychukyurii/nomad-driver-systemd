@@ -2,11 +2,7 @@ package task
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"os"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/hashicorp/nomad/plugins/drivers"
@@ -28,24 +24,6 @@ type unitController interface {
 	ResourceStats(ctx context.Context, unit string) (*systemd.ResourceStats, error)
 	StreamLogs(unit string, logCh chan<- *systemd.LogEntry) error
 }
-
-// safetyNetInterval is how long pollTaskState waits for a wake signal before
-// re-reading the unit's state anyway. A wake signal may be dropped or never
-// arrive, so it cannot be the only trigger.
-const safetyNetInterval = 30 * time.Second
-
-// logChannelBufferSize is how many log entries may queue between the journal
-// reader and the FIFO writer. A full buffer blocks the reader rather than
-// dropping entries.
-const logChannelBufferSize = 100
-
-// maxStdoutOpenRetries and stdoutRetryBackoffUnit bound how long streamLogs
-// waits for the task's stdout FIFO to appear, which Nomad may not have created
-// yet during recovery. Backoff is (attempt+1) * stdoutRetryBackoffUnit.
-const (
-	maxStdoutOpenRetries   = 5
-	stdoutRetryBackoffUnit = 100 * time.Millisecond
-)
 
 // Handler tracks one task's systemd unit and exposes the task's state to the
 // driver.
@@ -133,11 +111,6 @@ func NewHandler(taskID, unit string, handle *drivers.TaskHandle, units unitContr
 	return th
 }
 
-// closeWaitCh closes waitCh, at most once however many callers reach it.
-func (th *Handler) closeWaitCh() {
-	th.exitOnce.Do(func() { close(th.waitCh) })
-}
-
 // Start begins monitoring the task: it watches the unit's state and copies the
 // unit's journal into the task's stdout and stderr.
 //
@@ -203,219 +176,6 @@ func (th *Handler) SetStartedAt(t time.Time) {
 	defer th.stateLock.Unlock()
 
 	th.startedAt = t
-}
-
-// pollTaskState watches the unit until the task exits, woken by wakeCh and, as
-// an upper bound, by a safetyNetInterval ticker.
-func (th *Handler) pollTaskState() {
-	th.logger.Debug("starting state polling")
-
-	ticker := time.NewTicker(safetyNetInterval)
-	defer ticker.Stop()
-
-	// A change that happened before this handler existed produces no future wake
-	// signal, so check once up front.
-	if th.checkTaskState() {
-		return
-	}
-
-	for {
-		select {
-		case <-th.ctx.Done():
-			th.logger.Debug("state polling stopped")
-
-			return
-
-		case <-th.wakeCh:
-		case <-ticker.C:
-		}
-
-		if th.checkTaskState() {
-			return
-		}
-	}
-}
-
-// checkTaskState reads the unit's state once and feeds it into the task state
-// machine. It reports whether the task has exited, and so whether polling is
-// finished.
-func (th *Handler) checkTaskState() bool {
-	th.stateLock.RLock()
-	exited := th.state == drivers.TaskStateExited
-	th.stateLock.RUnlock()
-
-	if exited {
-		return true
-	}
-
-	state, err := th.units.UnitState(th.ctx, th.Unit)
-	if err != nil {
-		th.logger.Warn("get unit state", logx.Err(err))
-
-		return false
-	}
-
-	th.handleStateChange(state)
-
-	th.stateLock.RLock()
-	exited = th.state == drivers.TaskStateExited
-	th.stateLock.RUnlock()
-
-	return exited
-}
-
-// handleStateChange advances the task state machine to reflect activeState,
-// publishing the exit transition and closing waitCh when the unit has stopped.
-func (th *Handler) handleStateChange(activeState systemd.UnitState) {
-	cst := systemd.ToTaskState(activeState)
-
-	th.stateLock.Lock()
-
-	// Exited is terminal: a Nomad task cannot revive. This also guarantees
-	// waitCh is closed exactly once below.
-	if th.state == drivers.TaskStateExited {
-		th.stateLock.Unlock()
-
-		return
-	}
-
-	ost := th.state
-
-	if cst != drivers.TaskStateExited {
-		if ost != cst {
-			th.state = cst
-			th.logger.Info("task state changed", semconv.TaskStateChange(ost, cst), semconv.UnitState(activeState))
-		}
-		th.stateLock.Unlock()
-
-		return
-	}
-
-	th.stateLock.Unlock()
-
-	// Resolve the exit result before publishing the transition: this is a DBus
-	// round-trip, and flipping the state first would expose State=Exited with a
-	// nil ExitResult for its whole duration.
-	exitResult := th.buildExitResult(activeState)
-
-	th.stateLock.Lock()
-
-	// Re-checked because the lock was released for the round-trip above: the
-	// first result to be published wins, rather than being overwritten.
-	if th.state == drivers.TaskStateExited {
-		th.stateLock.Unlock()
-
-		return
-	}
-
-	th.state = drivers.TaskStateExited
-	th.completedAt = time.Now()
-	th.exitResult = exitResult
-	th.closeWaitCh()
-	th.stateLock.Unlock()
-
-	th.logger.Info("task state changed", semconv.TaskStateChange(ost, drivers.TaskStateExited), semconv.UnitState(activeState))
-}
-
-// buildExitResult determines the exit result of a unit that has just stopped.
-//
-// It reports the process's real exit code or terminating signal where systemd
-// knows it, and otherwise falls back to activeState alone: 0 for a clean stop, 1
-// for a failed one.
-func (th *Handler) buildExitResult(activeState systemd.UnitState) *drivers.ExitResult {
-	if status, err := th.units.UnitExitStatus(th.ctx, th.Unit); err == nil {
-		if result := systemd.ExitResultFromStatus(status); result != nil {
-			return result
-		}
-	} else {
-		th.logger.Debug("can't get unit exit status; falling back to the unit state", logx.Err(err))
-	}
-
-	if activeState.IsFailed() {
-		return &drivers.ExitResult{ExitCode: 1, Err: errors.New("systemd unit failed")}
-	}
-
-	return &drivers.ExitResult{ExitCode: 0}
-}
-
-// streamLogs copies journal entries from logCh to the task's stdout and stderr
-// FIFOs until the Handler stops.
-//
-// It gives up quietly if stdout cannot be opened, and falls back to stdout if
-// only stderr cannot be: losing logs must not fail the task.
-func (th *Handler) streamLogs() {
-	th.logger.Debug("starting log streamer")
-
-	// During recovery the FIFOs may not exist yet.
-	var (
-		stdout, stderr *os.File
-		err            error
-	)
-
-	for i := range maxStdoutOpenRetries {
-		stdout, err = os.OpenFile(th.handle.Config.StdoutPath, os.O_WRONLY|syscall.O_NONBLOCK, 0o600)
-		if err == nil {
-			break
-		}
-
-		if i < maxStdoutOpenRetries-1 {
-			th.logger.Debug("can't open stdout, retrying", logx.Err(err), semconv.RetryAttempt(i+1))
-			time.Sleep(time.Duration(i+1) * stdoutRetryBackoffUnit)
-		}
-	}
-
-	if err != nil {
-		th.logger.Warn("can't open stdout after retries; log streaming disabled", logx.Err(err))
-
-		return
-	}
-
-	defer stdout.Close()
-
-	stderr, err = os.OpenFile(th.handle.Config.StderrPath, os.O_WRONLY|syscall.O_NONBLOCK, 0o600)
-	if err != nil {
-		th.logger.Warn("can't open stderr; sending all logs to stdout", logx.Err(err))
-
-		stderr = stdout
-	} else {
-		defer stderr.Close()
-	}
-
-	for {
-		select {
-		case <-th.ctx.Done():
-			return
-
-		case logEntry, ok := <-th.logCh:
-			if !ok {
-				return
-			}
-
-			th.writeLogEntry(logEntry, stdout, stderr)
-		}
-	}
-}
-
-// writeLogEntry writes one entry to stderr if its priority is error or worse,
-// and to stdout otherwise.
-func (th *Handler) writeLogEntry(entry *systemd.LogEntry, stdout, stderr *os.File) {
-	writer := stdout
-	if entry.Priority == "0" || entry.Priority == "1" || entry.Priority == "2" || entry.Priority == "3" {
-		writer = stderr
-	}
-
-	priorityLevel := mapPriorityToLevel(entry.Priority)
-
-	var err error
-	if entry.SyslogIdentifier != "" {
-		_, err = fmt.Fprintf(writer, "[%s] [%s] %s\n", priorityLevel, entry.SyslogIdentifier, entry.Message)
-	} else {
-		_, err = fmt.Fprintf(writer, "[%s] %s\n", priorityLevel, entry.Message)
-	}
-
-	if err != nil {
-		th.logger.Warn("write log entry", logx.Err(err))
-	}
 }
 
 // TaskStatus returns a snapshot of the task's current status.
@@ -489,6 +249,18 @@ func (th *Handler) StopUnit() error {
 	return th.units.StopUnit(th.ctx, th.Unit)
 }
 
+// KillUnit sends SIGKILL to every process of the unit.
+//
+// It is the escalation for a [Handler.StopUnit] that did not finish in time. A
+// nil error means the signal was delivered, not that the unit has stopped, and an
+// error may simply mean there was nothing left to kill - so callers should
+// confirm against the unit's state rather than treat an error as failure.
+func (th *Handler) KillUnit() error {
+	th.logger.Warn("force killing unit")
+
+	return th.units.KillUnit(th.ctx, th.Unit)
+}
+
 // UnitState returns the unit's current systemd state.
 //
 // This reflects the unit itself, not the task state the Handler has published;
@@ -504,39 +276,7 @@ func (th *Handler) ResourceStats(ctx context.Context) (*systemd.ResourceStats, e
 	return th.units.ResourceStats(ctx, th.Unit)
 }
 
-// KillUnit sends SIGKILL to every process of the unit.
-//
-// It is the escalation for a [Handler.StopUnit] that did not finish in time. A
-// nil error means the signal was delivered, not that the unit has stopped, and an
-// error may simply mean there was nothing left to kill - so callers should
-// confirm against the unit's state rather than treat an error as failure.
-func (th *Handler) KillUnit() error {
-	th.logger.Warn("force killing unit")
-
-	return th.units.KillUnit(th.ctx, th.Unit)
-}
-
-// mapPriorityToLevel renders a syslog priority string as its conventional level
-// name, or "UNKNOWN" for anything that is not a priority digit.
-func mapPriorityToLevel(priority string) string {
-	switch priority {
-	case "0":
-		return "EMERG"
-	case "1":
-		return "ALERT"
-	case "2":
-		return "CRIT"
-	case "3":
-		return "ERR"
-	case "4":
-		return "WARN"
-	case "5":
-		return "NOTICE"
-	case "6":
-		return "INFO"
-	case "7":
-		return "DEBUG"
-	default:
-		return "UNKNOWN"
-	}
+// closeWaitCh closes waitCh, at most once however many callers reach it.
+func (th *Handler) closeWaitCh() {
+	th.exitOnce.Do(func() { close(th.waitCh) })
 }

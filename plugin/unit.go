@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package plugin
 
 import (
@@ -69,4 +72,32 @@ func (p *unitPolicy) check(unit string) error {
 	}
 
 	return fmt.Errorf("unit %q does not match any allowed_units pattern", unit)
+}
+
+// claimUnit records taskID as the sole owner of unit.
+//
+// It returns an error naming the current owner, and leaves ownership untouched,
+// if a different task already owns the unit. Re-claiming a unit the same task
+// already owns succeeds and changes nothing, which is what makes recovery
+// idempotent.
+func (d *Driver) claimUnit(unit, taskID string) error {
+	d.unitOwnersLock.Lock()
+	defer d.unitOwnersLock.Unlock()
+
+	if owner, exists := d.unitOwners[unit]; exists && owner != taskID {
+		return fmt.Errorf("unit %q is already managed by task %q", unit, owner)
+	}
+
+	d.unitOwners[unit] = taskID
+
+	return nil
+}
+
+// releaseUnit drops any ownership claim on unit. Releasing an unclaimed unit
+// does nothing.
+func (d *Driver) releaseUnit(unit string) {
+	d.unitOwnersLock.Lock()
+	defer d.unitOwnersLock.Unlock()
+
+	delete(d.unitOwners, unit)
 }

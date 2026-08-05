@@ -61,10 +61,13 @@ main.go → plugin.Driver → systemd.Manager → DBus / journal / cgroupfs
                        ↘ task.Handler (one per task)
 ```
 
-**`plugin/`** — the `drivers.DriverPlugin` implementation Nomad talks to. `driver.go` holds the RPC
-surface; `about.go` holds plugin metadata, HCL specs, `Config`/`TaskConfig` and unit-name
-validation; `unit_policy.go` compiles the allow/deny regexes; `pprof.go` is an optional debug
-server, enabled by a non-empty `pprof_addr` and reconfigured on config reload.
+**`plugin/`** — the `drivers.DriverPlugin` implementation Nomad talks to, one file per concern:
+`driver.go` holds the `Driver` type and the plugin-level RPCs (`SetConfig`, schemas,
+`Capabilities`); `task.go` the per-task RPCs (`RecoverTask`…`TaskEvents`); `fingerprint.go` the
+health loop; `about.go` plugin metadata and HCL specs; `config.go` `Config`/`TaskConfig` and
+unit-name validation; `unit.go` unit ownership (`claimUnit`/`releaseUnit`) and the compiled
+allow/deny regexes; `pprof.go` is an optional debug server, enabled by a non-empty `pprof_addr` and
+reconfigured on config reload.
 
 The `Manager` and the compiled `unitPolicy` are `atomic.Pointer` fields because `SetConfig` writes
 them while task RPCs and the fingerprint loop read them concurrently, with no ordering guarantee.
@@ -82,14 +85,18 @@ when it drops, so callers retry rather than discard it. Key invariants:
   `WakeChannel` (buffered by 1, so wakes coalesce), and the consumer re-reads state itself. The
   signal is documented lossy in go-systemd, hence the 30s safety-net ticker in `task.Handler`.
   Do not turn the wake into a carrier of state data.
-- `unit.go` holds the systemd→Nomad translation: `UnitState` predicates, `ToTaskState`,
-  `ExitResultFromStatus`. `conn.go` is the `dbusConn` interface over `*dbus.Conn` that makes the
-  Manager testable without a bus (see `fake_conn_test.go`).
+- `systemd.go` holds the `Manager` itself: its lifetime, the connection, and the reconnect loop.
+  `unit.go` holds everything unit-shaped — the systemd→Nomad translation (`UnitState` predicates,
+  `ToTaskState`, `ExitResultFromStatus`), registration and wake channels, and the unit operations.
+  `cgroup.go` and `journal.go` hold the two things read outside DBus: cgroup v2 accounting and the
+  journal reader. `conn.go` is the `dbusConn` interface over `*dbus.Conn` that makes the Manager
+  testable without a bus (see `fake_conn_test.go`).
 
 **`pkg/task/`** — one `Handler` per Nomad task, held in a `Store` keyed by task ID. It watches one
 unit, maps its systemd state to the task state Nomad expects, resolves the exit result once the
 unit stops, and copies the journal to stdout/stderr. It depends on the `unitController` interface,
-not on `*systemd.Manager` directly.
+not on `*systemd.Manager` directly. `task.go` holds the `Handler` and its API, `state.go` the state
+machine that watches the unit, `logs.go` the journal-to-FIFO copying.
 
 **`pkg/logx/`** — typed-attribute wrapper over hclog, replacing alternating key/value pairs.
 Every attribute key is named by a constructor in `pkg/logx/semconv/` (flat dot-separated
@@ -103,6 +110,9 @@ own packages — it takes interfaces or strings to avoid an import cycle.
   used consistently, is a comment on a struct field or invariant explaining *why* the
   synchronization is shaped that way — keep those.
 - **Package docs live in `doc.go`**, including for `main`.
+- **Declaration order within a file** follows: `const` → `type` → `var` → constructors → exported
+  methods → exported functions → unexported methods → unexported helpers. Public API comes before
+  implementation; a type's own constants stay next to the type, and helpers stay near their caller.
 - **A change to `configSpec` or `taskConfigSpec` in `plugin/about.go` is not finished until the
   examples match it.** `example/agent.hcl` mirrors the plugin block (driver-level options) and
   `example/example.nomad` the task block; the README documents both. Adding, renaming, removing or
