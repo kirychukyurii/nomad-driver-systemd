@@ -11,10 +11,7 @@ import (
 )
 
 func main() {
-	plugins.Serve(factory)
-}
-
-// factory builds the driver instance Nomad's plugin server serves.
-func factory(log hclog.Logger) any {
-	return plugin.New(log)
+	plugins.Serve(func(log hclog.Logger) any {
+		return plugin.New(log)
+	})
 }
