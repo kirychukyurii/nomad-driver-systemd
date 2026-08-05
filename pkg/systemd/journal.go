@@ -17,10 +17,10 @@ const (
 	// immediately; this is not a polling interval.
 	journalWaitTimeout = 1 * time.Second
 
-	// journalErrorBackoffMin/Max bound the retry delay after a journal read
-	// error, doubling on each consecutive failure and resetting on success.
-	journalErrorBackoffMin = 500 * time.Millisecond
-	journalErrorBackoffMax = 5 * time.Second
+	// journalErrorBackoffMinimum/Maximum bound the retry delay after a journal
+	// read error, doubling on each consecutive failure and resetting on success.
+	journalErrorBackoffMinimum = 500 * time.Millisecond
+	journalErrorBackoffMaximum = 5 * time.Second
 )
 
 // LogEntry is a single journald record emitted by a unit.
@@ -97,7 +97,7 @@ func (sm *Manager) StreamLogs(unit string, logCh chan<- *LogEntry) error {
 		defer sm.journalWg.Done()
 		defer journal.Close()
 
-		errBackoff := journalErrorBackoffMin
+		errBackoff := journalErrorBackoffMinimum
 
 		for {
 			select {
@@ -118,12 +118,12 @@ func (sm *Manager) StreamLogs(unit string, logCh chan<- *LogEntry) error {
 						return
 					}
 
-					errBackoff = min(errBackoff*2, journalErrorBackoffMax)
+					errBackoff = min(errBackoff*2, journalErrorBackoffMaximum)
 
 					continue
 				}
 
-				errBackoff = journalErrorBackoffMin
+				errBackoff = journalErrorBackoffMinimum
 
 				if n == 0 {
 					journal.Wait(journalWaitTimeout)
