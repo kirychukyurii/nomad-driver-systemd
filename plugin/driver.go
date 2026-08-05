@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad/client/lib/cpustats"
@@ -18,9 +19,18 @@ import (
 	"github.com/hashicorp/nomad/plugins/shared/hclspec"
 
 	"github.com/kirychuk/nomad-systemd-driver-plugin/pkg/logx"
+	"github.com/kirychuk/nomad-systemd-driver-plugin/pkg/logx/semconv"
 	"github.com/kirychuk/nomad-systemd-driver-plugin/pkg/systemd"
 	"github.com/kirychuk/nomad-systemd-driver-plugin/pkg/task"
 )
+
+// shutdownTimeout bounds how long [Driver.Shutdown] waits for the driver's
+// goroutines to finish.
+//
+// Nomad's plugin client force-kills the process two seconds after it closes the
+// plugin connection, so a teardown that has not finished within this budget would
+// be cut short anyway; the timeout makes it end on the driver's own terms instead.
+const shutdownTimeout = 1500 * time.Millisecond
 
 // Driver is the systemd task driver.
 //
@@ -75,11 +85,13 @@ type Driver struct {
 	logger logx.Logger
 }
 
+var _ drivers.DriverPlugin = (*Driver)(nil)
+
 // New returns a systemd task driver ready to be served to Nomad.
 //
 // The driver cannot run tasks until Nomad calls SetConfig, which establishes the
 // connection to systemd; until then it fingerprints itself as undetected.
-func New(logger hclog.Logger) drivers.DriverPlugin {
+func New(logger hclog.Logger) *Driver {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Driver{
@@ -155,6 +167,59 @@ func (d *Driver) TaskConfigSchema() (*hclspec.Spec, error) {
 // Capabilities returns the capabilities of the driver
 func (d *Driver) Capabilities() (*drivers.Capabilities, error) {
 	return capabilities, nil
+}
+
+// Shutdown releases everything the driver owns and blocks until it has, or until
+// [shutdownTimeout] elapses and whatever is still in flight is abandoned.
+//
+// It stops watching every task and closes the connection to systemd, but does not
+// stop the units: they are host-global, outlive the plugin, and are picked up again
+// by RecoverTask. The driver is unusable afterwards, so it must be called only once
+// Nomad has stopped issuing RPCs - that is, once the plugin server has returned -
+// and at most once.
+//
+// Shutdown is best-effort cleanup, not part of any contract a task relies on: Nomad
+// reaches it only when it closes the plugin connection gracefully, and never when
+// the process is killed outright.
+func (d *Driver) Shutdown() {
+	d.logger.Info("shutting down driver")
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		// Handlers before the manager: they read units through it, and stopping
+		// them first means no journal reader or state poll is left mid-call when
+		// the connection goes away.
+		for _, taskHandler := range d.tasks.Handlers() {
+			taskHandler.Stop()
+		}
+
+		if mgr := d.systemdMgr.Load(); mgr != nil {
+			mgr.Stop()
+		}
+
+		d.pprofLock.Lock()
+		if d.pprof != nil {
+			d.pprof.stop()
+			d.pprof = nil
+		}
+		d.pprofLock.Unlock()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(shutdownTimeout):
+		d.logger.Warn("driver shutdown timed out; abandoning what is still in flight",
+			semconv.Timeout(shutdownTimeout))
+	}
+
+	// Last, so that the fingerprint loop and the eventer stay usable for as long as
+	// the teardown above may still report on it.
+	d.signalShutdown()
+
+	d.logger.Info("driver shut down")
 }
 
 // getManager returns the systemd manager, or an error if SetConfig has not

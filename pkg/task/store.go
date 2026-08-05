@@ -40,6 +40,23 @@ func (ts *Store) Get(id string) (*Handler, bool) {
 	return handler, ok
 }
 
+// Handlers returns every stored handler, in no particular order.
+//
+// The result is a snapshot taken under the Store's lock: it is safe to iterate
+// while other goroutines mutate the Store, and it may already be stale by the
+// time a caller reads it.
+func (ts *Store) Handlers() []*Handler {
+	ts.lock.RLock()
+	defer ts.lock.RUnlock()
+
+	handlers := make([]*Handler, 0, len(ts.store))
+	for _, handler := range ts.store {
+		handlers = append(handlers, handler)
+	}
+
+	return handlers
+}
+
 // Delete removes any handler stored under id. Deleting an unknown id does
 // nothing.
 func (ts *Store) Delete(id string) {

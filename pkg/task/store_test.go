@@ -31,6 +31,45 @@ func TestStore_SetGetDelete(t *testing.T) {
 	}
 }
 
+func TestStore_Handlers(t *testing.T) {
+	store := NewStore()
+
+	if got := store.Handlers(); len(got) != 0 {
+		t.Fatalf("Handlers() on an empty store returned %d handlers, want 0", len(got))
+	}
+
+	a := &Handler{taskID: "a", Unit: "a.service"}
+	b := &Handler{taskID: "b", Unit: "b.service"}
+
+	store.Set("a", a)
+	store.Set("b", b)
+
+	got := store.Handlers()
+	if len(got) != 2 {
+		t.Fatalf("Handlers() returned %d handlers, want 2", len(got))
+	}
+
+	seen := make(map[*Handler]bool, len(got))
+	for _, h := range got {
+		seen[h] = true
+	}
+
+	if !seen[a] || !seen[b] {
+		t.Fatalf("Handlers() did not return both stored handlers")
+	}
+
+	// The snapshot is the caller's own: later mutation must not reach it.
+	store.Delete("a")
+
+	if len(got) != 2 {
+		t.Fatalf("Delete changed an already-returned snapshot: len = %d, want 2", len(got))
+	}
+
+	if remaining := store.Handlers(); len(remaining) != 1 || remaining[0] != b {
+		t.Fatalf("Handlers() after Delete = %v, want only the remaining handler", remaining)
+	}
+}
+
 func TestStore_ConcurrentAccess(t *testing.T) {
 	store := NewStore()
 

@@ -12,6 +12,10 @@
 // Without those lists any job submitter can take over arbitrary host units, as
 // this driver provides no isolation of its own.
 //
+// The plugin protocol has no shutdown call, so [Driver.Shutdown] is not an RPC:
+// it is the teardown a served driver's process runs once Nomad has closed the
+// plugin connection and stopped issuing RPCs.
+//
 // The driver provides no filesystem or network isolation, cannot send signals to
 // tasks, and cannot exec into them. Resource statistics require a host on the
 // unified (v2) cgroup hierarchy; the driver's fingerprint reports whether that
