@@ -192,9 +192,7 @@ func (d *Driver) Shutdown() {
 		// Handlers before the manager: they read units through it, and stopping
 		// them first means no journal reader or state poll is left mid-call when
 		// the connection goes away.
-		for _, taskHandler := range d.tasks.Handlers() {
-			taskHandler.Stop()
-		}
+		d.tasks.Stop()
 
 		if mgr := d.systemdMgr.Load(); mgr != nil {
 			mgr.Stop()

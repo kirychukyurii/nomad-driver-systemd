@@ -3,6 +3,8 @@ package task
 import (
 	"sync"
 	"testing"
+
+	"github.com/hashicorp/nomad/plugins/drivers"
 )
 
 func TestStore_SetGetDelete(t *testing.T) {
@@ -31,43 +33,35 @@ func TestStore_SetGetDelete(t *testing.T) {
 	}
 }
 
-func TestStore_Handlers(t *testing.T) {
+func TestStore_Stop(t *testing.T) {
 	store := NewStore()
 
-	if got := store.Handlers(); len(got) != 0 {
-		t.Fatalf("Handlers() on an empty store returned %d handlers, want 0", len(got))
+	// An empty Store has nothing to stop and must neither block nor panic.
+	store.Stop()
+
+	handlers := map[string]*Handler{
+		"a": newTestHandler(t, &fakeUnits{}, drivers.TaskStateRunning),
+		"b": newTestHandler(t, &fakeUnits{}, drivers.TaskStateRunning),
 	}
 
-	a := &Handler{taskID: "a", Unit: "a.service"}
-	b := &Handler{taskID: "b", Unit: "b.service"}
-
-	store.Set("a", a)
-	store.Set("b", b)
-
-	got := store.Handlers()
-	if len(got) != 2 {
-		t.Fatalf("Handlers() returned %d handlers, want 2", len(got))
+	for id, handler := range handlers {
+		store.Set(id, handler)
 	}
 
-	seen := make(map[*Handler]bool, len(got))
-	for _, h := range got {
-		seen[h] = true
+	store.Stop()
+
+	for id, handler := range handlers {
+		if _, ok := store.Get(id); ok {
+			t.Fatalf("Stop left handler %q in the store", id)
+		}
+
+		if handler.ctx.Err() == nil {
+			t.Fatalf("Stop left handler %q running", id)
+		}
 	}
 
-	if !seen[a] || !seen[b] {
-		t.Fatalf("Handlers() did not return both stored handlers")
-	}
-
-	// The snapshot is the caller's own: later mutation must not reach it.
-	store.Delete("a")
-
-	if len(got) != 2 {
-		t.Fatalf("Delete changed an already-returned snapshot: len = %d, want 2", len(got))
-	}
-
-	if remaining := store.Handlers(); len(remaining) != 1 || remaining[0] != b {
-		t.Fatalf("Handlers() after Delete = %v, want only the remaining handler", remaining)
-	}
+	// Nothing is left to stop, so this must not stop any handler a second time.
+	store.Stop()
 }
 
 func TestStore_ConcurrentAccess(t *testing.T) {
