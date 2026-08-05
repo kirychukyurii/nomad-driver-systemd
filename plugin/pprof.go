@@ -32,7 +32,7 @@ const (
 // pprofServer serves the net/http/pprof endpoints on a single address.
 //
 // The zero value is not usable: create one with [startPprof]. A server stops
-// when its context is cancelled or [pprofServer.stop] is called, whichever comes
+// when its context is canceled or [pprofServer.stop] is called, whichever comes
 // first; stop may be called any number of times.
 type pprofServer struct {
 	// addr is the configured listen address, as written in the driver
@@ -51,7 +51,7 @@ type pprofServer struct {
 }
 
 // startPprof binds addr and serves the pprof endpoints on it until ctx is
-// cancelled, returning an error if the address cannot be bound.
+// canceled, returning an error if the address cannot be bound.
 //
 // Binding happens before returning so that an unusable address is reported as a
 // configuration error; only serving is left to a goroutine.

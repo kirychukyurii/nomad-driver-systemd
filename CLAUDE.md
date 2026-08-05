@@ -38,12 +38,24 @@ Single test / single package inside that container:
 docker run --rm -v "$PWD":/workspace -w /workspace golang:1.24-bookworm sh -c "apt-get update -qq && apt-get install -y -qq libsystemd-dev && go test -race -run TestHandler_HandleStateChange ./pkg/task/"
 ```
 
-The dev container (`.devcontainer/`, Ubuntu + Go 1.24.4 + systemd headers) is the interactive
-equivalent; inside it `make test`, `make vet`, `make build` work directly. `make vet` deliberately
-no-ops on non-Linux.
+The dev container (`.devcontainer/`, Debian 12 + Go 1.24.4 + systemd headers + golangci-lint) is
+the interactive equivalent; inside it `make test`, `make vet`, `make build`, `make lint` work
+directly. `make vet` deliberately no-ops on non-Linux.
 
-Lint and format both go through golangci-lint v2 (`make lint`, `make fmt`, `make fmt-check`) and do
-run on macOS. `.golangci.yaml` is large and strict — notable enforced conventions:
+**Prefer the dev container image over the throwaway `golang:` containers above** — once an IDE has
+built it, it already carries `libsystemd-dev`, the module cache and golangci-lint, so a run costs
+seconds instead of an `apt-get`/`go install` round trip on every invocation:
+
+```bash
+docker run --rm -v "$PWD":/workspace -w /workspace -v nomad-systemd-driver-plugin-gomodcache:/go/pkg/mod "$(docker images --format '{{.Repository}}:{{.Tag}}' | grep -m1 nomad-systemd-driver-plugin)" bash -lc "make lint && make test"
+```
+
+Lint and format both go through golangci-lint v2 (`make lint`, `make fmt`, `make fmt-check`).
+`make fmt` runs on macOS; **`make lint` does not** — it type-checks, so it fails on the same missing
+`systemd/sd-journal.h` and has to run in Linux like everything else. Installing the linter from
+source needs Go ≥ 1.25, newer than the Go in the dev container's own image.
+
+`.golangci.yaml` is large and strict — notable enforced conventions:
 
 - `gci` import order: standard → default → `github.com/webitel` → local module → blank → dot.
 - `containedctx` is enabled; the three structs that legitimately hold a lifetime context carry

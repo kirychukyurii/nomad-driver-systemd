@@ -154,7 +154,10 @@ func TestConfigurePprof_EmptyAddrStopsServer(t *testing.T) {
 		t.Fatal("empty pprof_addr left a server running")
 	}
 
-	if _, err := get(t, "http://"+addr+"/debug/pprof/cmdline"); err == nil {
+	resp, err := get(t, "http://"+addr+"/debug/pprof/cmdline")
+	if err == nil {
+		_ = resp.Body.Close()
+
 		t.Fatal("stopped pprof server is still serving")
 	}
 }
@@ -183,8 +186,9 @@ func TestConfigurePprof_ShutdownStopsServer(t *testing.T) {
 
 	d.signalShutdown()
 
-	// The listener closes asynchronously once the driver context is cancelled.
+	// The listener closes asynchronously once the driver context is canceled.
 	deadline := time.Now().Add(2 * time.Second)
+
 	for {
 		resp, err := get(t, "http://"+addr+"/debug/pprof/cmdline")
 		if err != nil {
