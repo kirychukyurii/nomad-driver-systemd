@@ -3,8 +3,11 @@ package plugin
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad/plugins/drivers"
@@ -108,4 +111,117 @@ func newRunningTask(t *testing.T, d *Driver, units *fakeUnits) *task.Handler {
 	t.Helper()
 
 	return newTask(t, d, units, drivers.TaskStateRunning)
+}
+
+// blockingUnits holds a state read open until its gate is closed, so that a test
+// can observe what happens while a handler is mid-call.
+type blockingUnits struct {
+	*fakeUnits
+
+	gate chan struct{}
+}
+
+func (b *blockingUnits) UnitState(ctx context.Context, unit string) (systemd.UnitState, error) {
+	<-b.gate
+
+	return b.fakeUnits.UnitState(ctx, unit)
+}
+
+// newStartedTaskHandle returns a handle whose log paths are ordinary files, so
+// that a started Handler streams logs instead of retrying absent FIFOs.
+func newStartedTaskHandle(t *testing.T) *drivers.TaskHandle {
+	t.Helper()
+
+	dir := t.TempDir()
+	paths := make([]string, 0, 2)
+
+	for _, name := range []string{"stdout", "stderr"} {
+		path := filepath.Join(dir, name)
+
+		f, err := os.Create(path)
+		if err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+
+		_ = f.Close()
+
+		paths = append(paths, path)
+	}
+
+	return &drivers.TaskHandle{
+		Config: &drivers.TaskConfig{StdoutPath: paths[0], StderrPath: paths[1]},
+	}
+}
+
+func TestDriver_Shutdown_WaitsForTaskHandlers(t *testing.T) {
+	d := newTestDriver()
+
+	units := &blockingUnits{fakeUnits: &fakeUnits{}, gate: make(chan struct{})}
+	h := task.NewHandler("task-1", "app.service", newStartedTaskHandle(t), units, nil, drivers.TaskStateRunning, logx.New(hclog.NewNullLogger()))
+	d.tasks.Set("task-1", h)
+	h.Start()
+
+	returned := make(chan struct{})
+
+	go func() {
+		defer close(returned)
+
+		d.Shutdown()
+	}()
+
+	select {
+	case <-returned:
+		t.Fatal("Shutdown returned while a task handler was still mid-call")
+
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(units.gate)
+
+	select {
+	case <-returned:
+	case <-time.After(shutdownTimeout + time.Second):
+		t.Fatal("Shutdown did not return after the task handler was released")
+	}
+
+	if !units.called("state") {
+		t.Fatal("expected the handler to have read the unit state before stopping")
+	}
+
+	if d.ctx.Err() == nil {
+		t.Fatal("Shutdown left the driver context live")
+	}
+}
+
+func TestDriver_Shutdown_StopsPprof(t *testing.T) {
+	d := newTestDriver()
+
+	addr := freeLoopbackAddr(t)
+
+	if err := d.configurePprof(addr); err != nil {
+		t.Fatalf("configurePprof = %v, want nil", err)
+	}
+
+	d.Shutdown()
+
+	if d.pprof != nil {
+		t.Fatal("Shutdown left a pprof server behind")
+	}
+
+	resp, err := get(t, "http://"+addr+"/debug/pprof/cmdline")
+	if err == nil {
+		_ = resp.Body.Close()
+
+		t.Fatal("pprof server is still serving after Shutdown")
+	}
+}
+
+func TestDriver_Shutdown_WithoutManagerOrTasks(t *testing.T) {
+	d := newTestDriver()
+
+	d.Shutdown()
+
+	if d.ctx.Err() == nil {
+		t.Fatal("Shutdown left the driver context live")
+	}
 }

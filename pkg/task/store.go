@@ -8,7 +8,8 @@ import "sync"
 // is not usable: create a Store with [NewStore].
 //
 // A Store holds handlers but does not own their lifecycle: removing a handler
-// neither stops it nor stops its unit.
+// neither stops it nor stops its unit. [Store.Stop] is the sole exception, and it
+// too leaves the units alone.
 type Store struct {
 	store map[string]*Handler
 	lock  sync.RWMutex
@@ -47,4 +48,39 @@ func (ts *Store) Delete(id string) {
 	defer ts.lock.Unlock()
 
 	delete(ts.store, id)
+}
+
+// Stop empties the Store and stops every handler it held, blocking until they
+// have all finished.
+//
+// Handlers are stopped concurrently, so the slowest one to finish sets how long
+// this takes rather than their sum. It does not stop their units, which outlive
+// the handlers watching them. Handlers are removed before being stopped, so a
+// concurrent lookup finds nothing rather than a handler on its way out, and a
+// second Stop has nothing left to do - which is what keeps each handler stopped
+// at most once, as [Handler.Stop] requires.
+func (ts *Store) Stop() {
+	ts.lock.Lock()
+
+	handlers := make([]*Handler, 0, len(ts.store))
+	for _, handler := range ts.store {
+		handlers = append(handlers, handler)
+	}
+
+	ts.store = make(map[string]*Handler)
+	ts.lock.Unlock()
+
+	var wg sync.WaitGroup
+
+	for _, handler := range handlers {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			handler.Stop()
+		}()
+	}
+
+	wg.Wait()
 }
