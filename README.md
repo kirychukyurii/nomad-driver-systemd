@@ -82,6 +82,10 @@ nomad node status -self
 | `denied_units`  | `list(string)` | Regexes. A unit matching any of them is always rejected, even if it also matches `allowed_units`.                                      |
 | `pprof_addr`    | `string`       | Address for a debug pprof server, e.g. `127.0.0.1:6061`. Empty disables it. Keep it on loopback — the profiles expose process memory.   |
 
+Both pattern lists are matched unanchored, as Go's `regexp.MatchString` does: `nginx\.service`
+also matches `not-my-nginx.service`. Anchor patterns with `^` and `$`. An invalid regex fails
+`SetConfig`, so the driver refuses to load rather than silently matching nothing.
+
 ## Job specification
 
 ```hcl
